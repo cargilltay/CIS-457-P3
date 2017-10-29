@@ -210,3 +210,16 @@ int main() {
 }
 
 
+void createEthernetHeader(char buffer[0]) {
+
+}
+
+void createArpResponseHeader(char buffer[0]) {
+
+}
+
+void createArpResponse(char buffer[0]) {
+
+}
+
+
