@@ -24,10 +24,10 @@ struct __attribute__((packed)) arp_header
         unsigned char arp_hdl;
         unsigned char arp_prl;
         unsigned short arp_op;
+	unsigned char arp_dha[6];
+        unsigned char arp_dpa[4];
         unsigned char arp_sha[6];
         unsigned char arp_spa[4];
-        unsigned char arp_dha[6];
-        unsigned char arp_dpa[4];
 };
 
 struct Interface {
@@ -233,6 +233,7 @@ void handleArpRequest(char buf[BUFFER_SIZE], unsigned char myMac[6], unsigned ch
 				buffer[i] = 0;
 			}
 
+			//TODO: The destination isn't correct
 			addEthernetHeader(buffer, ethernetHeader->h_source, myMac);
 			addArpResponseHeader(buffer, myMac, arpHeader->arp_sha, myIp, arpHeader->arp_spa);
 
@@ -241,6 +242,7 @@ void handleArpRequest(char buf[BUFFER_SIZE], unsigned char myMac[6], unsigned ch
 				printf("%02x ", buffer[i]);
 			}
 			printf(" \n");
+
 			send(packet_socket, buffer, BUFFER_SIZE, 0);
 		}
 	}
@@ -248,6 +250,7 @@ void handleArpRequest(char buf[BUFFER_SIZE], unsigned char myMac[6], unsigned ch
 
 
 void addEthernetHeader(unsigned char * buf, unsigned char dest[6], unsigned char src[6]) {
+	//TODO: I think we're using the wrong ethernet header object. Should be ether_header
 	int i;
 	unsigned char* ethhead = (unsigned char*) buf;
 	struct ethhdr *ethernetHeader = (struct ethhdr *) ethhead;
@@ -280,9 +283,20 @@ void addArpResponseHeader(unsigned char * buf, unsigned char sourceMac[6], unsig
 	//DHA = target mac
 	//dpa = target ip
 
+
+	//unsigned short arp_hd;
+        //unsigned short arp_pr;
+        //unsigned char arp_hdl;
+        //unsigned char arp_prl;
+
 	struct arp_header *arpHeader = (struct arp_header *)arphead;
 
-	arpHeader->arp_op = htons(ARPOP_REPLY);
+	arpHeader->arp_hd = htons(0x01);
+	arpHeader->arp_pr = htons(0x800);
+	arpHeader->arp_hdl = 0x6;
+	arpHeader->arp_prl = 0x4;
+
+	arpHeader->arp_op = htons(0x02);
 	for (i = 0; i < 4; i++) {
 		arpHeader->arp_spa[i] = sourceIp[i];
 		arpHeader->arp_dpa[i] = destIp[i];
