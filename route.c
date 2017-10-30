@@ -37,10 +37,19 @@ struct Interface {
 	char * ipAddress;
 };
 
+void handleArpRequest(char buf[BUFFER_SIZE], char myMac[6], int packet_socket);
+void addEthernetHeader(char * buffer, char dest[6], char src[6]);
+void addArpResponseHeader(char * buf, char mac[6]);
+
 int main() {
 	int packet_socket;
+
+	unsigned char myMac[6];
+	char * myIp;
+
 	struct Interface interfaces[NUM_INTERFACE];
 	int i;
+		for (i = 0; i < 6; i++) { myMac[i] = 0; }
 	for (i = 0; i < NUM_INTERFACE; i++) { interfaces[i].valid = 0; }
 
 	//get list of interfaces (actually addresses)
@@ -52,6 +61,7 @@ int main() {
 
 	//have the list, loop over the list
 	for(tmp = ifaddr; tmp!=NULL; tmp=tmp->ifa_next){
+		//IPV4
 		if (tmp->ifa_addr->sa_family == AF_INET) {
             		char * ipAddress = inet_ntoa(((struct sockaddr_in *) tmp->ifa_addr)->sin_addr);
 
@@ -87,6 +97,7 @@ int main() {
 		//about those for the purpose of enumerating interfaces. We can
 		//use the AF_INET addresses in this list for example to get a list
 		//of our own IP addresses
+		//MAC
 		if (tmp->ifa_addr->sa_family == AF_PACKET) {
 			printf("Interface: %s\n", tmp->ifa_name);
 			
@@ -149,6 +160,13 @@ int main() {
 			printf("\nInformation for interface %s:\n", interfaces[i].name);
 			printf("\tMAC Address is: %02x:%02x:%02x:%02x:%02x:%02x \n", interfaces[i].macAddress[0], interfaces[i].macAddress[1], interfaces[i].macAddress[2], interfaces[i].macAddress[3], interfaces[i].macAddress[4], interfaces[i].macAddress[5]);
 			printf("\tIP Address is: %s \n\n", interfaces[i].ipAddress);
+
+			if (strncmp(&(interfaces[i].name[3]), "eth0", 4) == 0) {
+				printf("Set myMac\n");
+				memcpy(myMac, interfaces[i].macAddress, 6);
+				myIp = (char *)malloc(strlen(interfaces[i].ipAddress));
+				strcpy(myIp, interfaces[i].ipAddress);
+			}
 		}
 	}
 
@@ -187,21 +205,8 @@ int main() {
 		//is not necessary, since the headers, including all addresses,
 		//need to be in the buffer you are sending)
 
-		//Get ethernet header from the buffer
-		unsigned char* ethhead = (unsigned char*) buf;
-		struct ethhdr *ethernetHeader = (struct ethhdr *) ethhead;
-
-		//Get arp header from the buffer if we're an arp packet
-		if (ntohs(ethernetHeader->h_proto) == ETH_P_ARP) {
-			printf("Got an arp thing.\n");
-			unsigned char* arphead = buf + 14;
-			struct arp_header *arpHeader = (struct arp_header *)arphead;
-
-			if (ntohs(arpHeader->arp_op) == ARPOP_REQUEST) {
-				printf("Got an arp request.\n");
-		
-			}
-		}
+		//Handle any arp requests
+		handleArpRequest(buf, myMac, packet_socket);
 
 	}
 
@@ -209,17 +214,118 @@ int main() {
 	return 0;
 }
 
+void handleArpRequest(char buf[BUFFER_SIZE], char myMac[6], int packet_socket) {
+	//Get ethernet header from the buffer
+	int i = 0;
+	unsigned char* ethhead = (unsigned char*) buf;
+	struct ethhdr *ethernetHeader = (struct ethhdr *) ethhead;
 
-void createEthernetHeader(char buffer[0]) {
+	//Get arp header from the buffer if we're an arp packet
+	if (ntohs(ethernetHeader->h_proto) == ETH_P_ARP) {
+		printf("Got an arp thing.\n");
+		unsigned char* arphead = buf + 14;
+		struct arp_header *arpHeader = (struct arp_header *)arphead;
 
+		if (ntohs(arpHeader->arp_op) == ARPOP_REQUEST) {
+			printf("Got an arp request.\n");
+			//TODO: Need to check if it's our IP address, otherwise we want to ignore.
+
+			char buffer[BUFFER_SIZE];
+			for (i = 0; i < BUFFER_SIZE; i++) {
+				buffer[i] = 0;
+			}
+
+			addEthernetHeader(buffer, ethernetHeader->h_source, myMac);
+			addArpResponseHeader(buffer, myMac);
+
+			printf("\tMAC Address is: %02x:%02x:%02x:%02x:%02x:%02x \n", myMac[0], myMac[1], myMac[2], myMac[3], myMac[4], myMac[5]);
+			send(packet_socket, buffer, BUFFER_SIZE, 0);
+		}
+	}
 }
 
-void createArpResponseHeader(char buffer[0]) {
 
+void addEthernetHeader(char * buffer, char dest[6], char src[6]) {
+	int i;
+	char header[14];
+	for (i = 0; i < 14; i++) { header[i] = 0; } //Initialize header to all 0's so we don't have junk data
+
+	//TODO: Not sure if we'll need different ethernet types later. May need to be passed in.
+
+	//Set the destination and source addresses in the header
+	for (i = 0; i < 6; i++) {
+		header[i] = dest[i];
+		header[i + 6] = src[i];
+	}
+
+	//TODO: Not sure if this section is right yet.
+	//Set the ethernet type (ARP)
+	uint16_t type = htons(0x806);
+	header[12] = type << 8;
+	header[13] = type;
+	
+	//Put the header into the buffer
+	for (i = 0; i < 14; i++) {
+		buffer[i] = header[i];
+	}
 }
+
+void addArpResponseHeader(char * buf, char mac[6]) {
+	int i;
+	unsigned char* arphead = buf + 14;
+
+	unsigned char arp_dha_buffer[6];
+	unsigned char arp_dpa_buffer[4];
+
+	struct arp_header *arpHeader = (struct arp_header *)arphead;
+
+	arpHeader->arp_op = htons(ARPOP_REPLY);
+	for (i = 0; i < 4; i++) {
+		arp_dpa_buffer[i] = arpHeader->arp_dpa[i];
+	}
+
+	for (i = 0; i < 6; i++) {
+		arp_dha_buffer[i] = arpHeader->arp_sha[i];
+	}
+
+	for (i = 0; i < 4; i++) {
+		arpHeader->arp_dpa[i] = arpHeader->arp_spa[i];
+	}
+
+	for (i = 0; i < 4; i++) {
+		arpHeader->arp_spa[i] = arp_dpa_buffer[i];
+	}
+
+	for (i = 0; i < 6; i++) {
+		arpHeader->arp_sha[i] = mac[i];
+	}
+
+	unsigned char * arpHeaderBuffer = (unsigned char *)arpHeader;
+	for (i = 0; i < sizeof(struct arp_header); i++) {
+		buf[i + 14] = arpHeaderBuffer[i];
+	}
+}
+
+
 
 void createArpResponse(char buffer[0]) {
-
+	
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
