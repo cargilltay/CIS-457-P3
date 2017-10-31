@@ -1,3 +1,10 @@
+/**
+ * CIS 457
+ * Project 3
+ * Fall, 2017
+ * Authors: David Lamar, Taylor Cargill
+ */
+
 #include <sys/socket.h> 
 #include <netpacket/packet.h> 
 #include <net/ethernet.h>
@@ -20,6 +27,8 @@
 //TODO: This is currently hard coded; the project would never have more than 10 interfaces, but this is probably bad practice.
 #define NUM_INTERFACE 10
 
+
+//This was taken from the internet; it's been modified to be in the correct order
 struct __attribute__((packed)) arp_header
 {
         unsigned short arp_hd;
@@ -40,16 +49,24 @@ struct Interface {
 	unsigned char ipAddress[4];
 };
 
+
+//Headers:
 void handleArpRequest(char buf[BUFFER_SIZE], unsigned char myMac[6], unsigned char myIp[4], int packet_socket);
+void handleICMPRequest(char buf[BUFFER_SIZE], unsigned char myMac[6], unsigned char sourceIp[4], int packet_socket);
 
-void handleICMPRequest(char buf[BUFFER_SIZE], unsigned char sourceIp[4]);
 void addIpHeader(unsigned char * buf, unsigned char sourceIp[4], unsigned char destIp[4]);
-
-void addEthernetHeader(unsigned char * buffer, unsigned char dest[6], unsigned char src[6]);
+void addEthernetHeader(unsigned char * buf, unsigned char dest[6], unsigned char src[6], int ethType);
+void addICMPHeader(unsigned char * buf, char * data, char id[2], char seq[2]);
 void addArpResponseHeader(unsigned char * buf, unsigned char sourceMac[6], unsigned char destMac[6], unsigned char senderIp[4], unsigned char destIp[4]);
+
+unsigned int calculateChecksum(unsigned char * buffer, int size);
+
 void createIPArray(unsigned char * buffer, char * ip);
 
+
+
 int main() {
+	srand(time(NULL));
 	int packet_socket;
 
 	unsigned char myMac[6];
@@ -213,8 +230,8 @@ int main() {
 		//Handle any arp requests
 		handleArpRequest(buf, myMac, myIp, packet_socket);
 
-		handleICMPRequest(buf, myIp);
-
+		//Handle any ICMP requests
+		handleICMPRequest(buf, myMac, myIp, packet_socket);
 	}
 
 	//exit
@@ -222,9 +239,10 @@ int main() {
 }
 
 
-
-//******************* ICMP Functions ****************************************************
-void handleICMPRequest(char buf[BUFFER_SIZE], unsigned char sourceIp[4]) {
+//********************************************************************************************************
+//***********************************************  ICMP Functions  ***************************************
+//********************************************************************************************************
+void handleICMPRequest(char buf[BUFFER_SIZE], unsigned char myMac[6], unsigned char sourceIp[4], int packet_socket) {
 	int i = 0;
 	unsigned char* ethhead = (unsigned char*) buf;
 	struct ethhdr *ethernetHeader = (struct ethhdr *) ethhead;
@@ -245,13 +263,33 @@ void handleICMPRequest(char buf[BUFFER_SIZE], unsigned char sourceIp[4]) {
 		}
 
 		unsigned char destIp[4];
-		destIp[3] = ipHeader->daddr >> 24;
-		destIp[2] = ipHeader->daddr >> 16;
-		destIp[1] = ipHeader->daddr >> 8;
-		destIp[0] = ipHeader->daddr;
+		destIp[3] = ipHeader->saddr >> 24;
+		destIp[2] = ipHeader->saddr >> 16;
+		destIp[1] = ipHeader->saddr >> 8;
+		destIp[0] = ipHeader->saddr;
 
+		int sub = (14 + 20 + 8);
+		int dataSize = ICMP_SIZE - sub;
+		char data[dataSize];
+		for (i = 0; i < dataSize; i++) {
+			data[i] = (buf + sub)[i];
+		}
+
+		char id[2];
+		char seq[2];
+
+		for (i = 0; i < 2; i++) {
+			id[i] = buf[14 + 20 + 4 + i];
+			seq[i] = buf[14 + 20 + 6 + i];
+		}
+
+		addEthernetHeader(buffer, ethernetHeader->h_source, myMac, 0x0800);
 		addIpHeader(buffer, sourceIp, destIp);
+		addICMPHeader(buffer, data, id, seq);
 
+		printf("Sending ICMP Response. \n");
+
+		send(packet_socket, buffer, ICMP_SIZE, 0);
 	}
 }
 
@@ -263,43 +301,86 @@ void addIpHeader(unsigned char * buf, unsigned char sourceIp[4], unsigned char d
 	ipHeader->version = 0x4;
 	ipHeader->ihl = 0x5;
 	ipHeader->tos = 0;
-	ipHeader->tot_len = ICMP_SIZE; 
-	ipHeader->id = rand();
+	ipHeader->tot_len = htons(ICMP_SIZE); 
+	ipHeader->id = htons(rand());
 	ipHeader->frag_off = 0;
 	ipHeader->ttl = 64;
 	ipHeader->protocol = 0x1;
 	ipHeader->check = 0; //Set as 0 so we don't have junk bits
 
-	ipHeader->saddr = sourceIp[0] << 24 & sourceIp[1] << 16 & sourceIp[2] << 8 & sourceIp[3];
-	ipHeader->daddr = destIp[0] << 24 & destIp[1] << 16 & destIp[2] << 8 & destIp[3];
+	for (i = 0; i < 4; i++) {
+		buf[i + 14 + 12] = sourceIp[i];
+		buf[i + 14 + 12 + 4] = destIp[i];
+	}
 
 	unsigned char * ipBuffer = (unsigned char *)ipHeader;
 	for (i = 0; i < sizeof(struct iphdr); i++) {
 		buf[i + 14] = ipBuffer[i];
 	}
 
-	ipHeader->check = calculateChecksum(buf + 14);
-}
+	unsigned int checksum = calculateChecksum(buf + 14, 20);
+	buf[14 + 10] = checksum >> 8;
+	buf[14 + 11] = checksum;
 
-void addICMPHeader() {
-
-}
-
-
-int calculateChecksum(unsigned char buffer[20]) {
-	long checksum = 0;
-	int i;
+	printf("IP Header: ");
 	for (i = 0; i < 20; i++) {
-		checksum += ((buffer[i] << 8) & buffer[i]);
+		printf("%02x ", buf[i + 14]);
+	}
+	printf("\n");
+}
+
+void addICMPHeader(unsigned char * buf, char * data, char id[2], char seq[2]) {
+	int i;
+	unsigned char * icmpHead = (unsigned char *) buf + 14 + sizeof(struct iphdr);
+	struct icmphdr * icmpHeader = (struct icmphdr *) icmpHead;
+
+	icmpHeader->type = 0;
+	icmpHeader->code = 0;
+	icmpHeader->checksum = 0;
+	
+	//put initial bytes into buffer
+	unsigned char * icmpBuffer = (unsigned char *)icmpHeader;
+	for (i = 0; i < 4; i++) {
+		buf[i + 14 + sizeof(struct iphdr)] = icmpBuffer[i];
+	}
+
+	for (i = 0; i < 2; i++) {
+		buf[i + 14 + sizeof(struct iphdr) + 4] = id[i];
+		buf[i + 14 + sizeof(struct iphdr) + 6] = seq[i];
+	}
+
+	//Puts the data into the packet
+	for (i = 14 + sizeof(struct iphdr) + 8; i < ICMP_SIZE; i++) {
+		buf[i] = data[i - (14 + sizeof(struct iphdr) + 8)];
+	}
+
+	unsigned int checksum = calculateChecksum(buf + 14 + sizeof(struct iphdr), ICMP_SIZE - 14 - 20);
+	buf[14 + sizeof(struct iphdr) + 2] = checksum >> 8;
+	buf[14 + sizeof(struct iphdr) + 3] = checksum;
+
+	printf("ICMP Header: ");
+	for (i = 0; i < 98; i++) {
+		printf("%02x ", buf[i + 14 + sizeof(struct iphdr)]);
+	}
+	printf("\n");
+}
+
+unsigned int calculateChecksum(unsigned char * buffer, int size) {
+	unsigned int checksum = 0;
+	int i;
+
+	for (i = 0; i < size; i += 2) {
+		checksum += ((buffer[i] << 8) + buffer[i + 1]);
 	}
 
 	checksum = (checksum >> 16) + checksum;
-	return checksum;
+	return (unsigned int)~checksum;
 }
 
 
-
-//****************** ARP Functions ******************************************************
+//********************************************************************************************************
+//********************************************  ARP Functions  *******************************************
+//********************************************************************************************************
 
 void handleArpRequest(char buf[BUFFER_SIZE], unsigned char myMac[6], unsigned char myIp[4], int packet_socket) {
 	//Get ethernet header from the buffer
@@ -321,7 +402,7 @@ void handleArpRequest(char buf[BUFFER_SIZE], unsigned char myMac[6], unsigned ch
 				buffer[i] = 0;
 			}
 
-			addEthernetHeader(buffer, ethernetHeader->h_source, myMac);
+			addEthernetHeader(buffer, ethernetHeader->h_source, myMac, 0x0806);
 			addArpResponseHeader(buffer, myMac, arpHeader->arp_sha, myIp, arpHeader->arp_spa);
 
 			printf("Sending arp response; the buffer is: ");
@@ -330,17 +411,16 @@ void handleArpRequest(char buf[BUFFER_SIZE], unsigned char myMac[6], unsigned ch
 			}
 			printf(" \n");
 
-			send(packet_socket, buffer, BUFFER_SIZE, 0);
+			send(packet_socket, buffer, 42, 0);
 		}
 	}
 }
 
-
-void addEthernetHeader(unsigned char * buf, unsigned char dest[6], unsigned char src[6]) {
+void addEthernetHeader(unsigned char * buf, unsigned char dest[6], unsigned char src[6], int ethType) {
 	int i;
 	unsigned char* ethhead = (unsigned char*) buf;
 	struct ethhdr *ethernetHeader = (struct ethhdr *) ethhead;
-	ethernetHeader->h_proto = htons(0x806);
+	ethernetHeader->h_proto = htons(ethType);
 	
 	for (i = 0; i < 6; i++) {
 		ethernetHeader->h_dest[i] = dest[i];
