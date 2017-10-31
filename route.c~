@@ -36,10 +36,15 @@ struct __attribute__((packed)) arp_header
         unsigned char arp_hdl;
         unsigned char arp_prl;
         unsigned short arp_op;
-	unsigned char arp_dha[6];
-        unsigned char arp_dpa[4];
         unsigned char arp_sha[6];
         unsigned char arp_spa[4];
+	unsigned char arp_dha[6];
+        unsigned char arp_dpa[4];
+
+	//SHA is sender mac
+	//spa is sender ip
+	//DHA = target mac
+	//dpa = target ip
 };
 
 struct Interface {
@@ -152,6 +157,8 @@ int main() {
 			}
 
 			//create a packet socket on interface r?-eth1
+			//TODO: We need to open connections on the other interfaces as well.
+			//TODO: May need to thread in order to handle this "It's a good idea"
 			if (!strncmp(&(tmp->ifa_name[3]), "eth1", 4)) {
 				printf("Creating Socket on interface %s\n", tmp->ifa_name);
 				//create a packet socket
@@ -184,7 +191,7 @@ int main() {
 			printf("\tMAC Address is: %02x:%02x:%02x:%02x:%02x:%02x \n", interfaces[i].macAddress[0], interfaces[i].macAddress[1], interfaces[i].macAddress[2], interfaces[i].macAddress[3], interfaces[i].macAddress[4], interfaces[i].macAddress[5]);
 			printf("\tIP Address is: %d.%d.%d.%d (%02x %02x %02x %02x)\n\n", interfaces[i].ipAddress[0], interfaces[i].ipAddress[1], interfaces[i].ipAddress[2], interfaces[i].ipAddress[3], interfaces[i].ipAddress[0], interfaces[i].ipAddress[1], interfaces[i].ipAddress[2], interfaces[i].ipAddress[3]);
 
-			if (strncmp(&(interfaces[i].name[3]), "eth0", 4) == 0) {
+			if (strncmp(&(interfaces[i].name[3]), "eth1", 4) == 0) {
 				printf("Set myMac\n");
 				memcpy(myMac, interfaces[i].macAddress, 6);
 				memcpy(myIp, interfaces[i].ipAddress, 4);
@@ -267,6 +274,12 @@ void handleICMPRequest(char buf[BUFFER_SIZE], unsigned char myMac[6], unsigned c
 		destIp[2] = ipHeader->saddr >> 16;
 		destIp[1] = ipHeader->saddr >> 8;
 		destIp[0] = ipHeader->saddr;
+
+		unsigned char sourceIp[4];
+		sourceIp[3] = ipHeader->daddr >> 24;
+		sourceIp[2] = ipHeader->daddr >> 16;
+		sourceIp[1] = ipHeader->daddr >> 8;
+		sourceIp[0] = ipHeader->daddr;
 
 		int sub = (14 + 20 + 8);
 		int dataSize = ICMP_SIZE - sub;
@@ -403,7 +416,7 @@ void handleArpRequest(char buf[BUFFER_SIZE], unsigned char myMac[6], unsigned ch
 			}
 
 			addEthernetHeader(buffer, ethernetHeader->h_source, myMac, 0x0806);
-			addArpResponseHeader(buffer, myMac, arpHeader->arp_sha, myIp, arpHeader->arp_spa);
+			addArpResponseHeader(buffer, myMac, arpHeader->arp_sha, arpHeader->arp_dpa, arpHeader->arp_spa);
 
 			printf("Sending arp response; the buffer is: ");
 			for (i = 0; i < 42; i++) {
