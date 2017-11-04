@@ -67,8 +67,8 @@ struct Route {
 
 
 //Headers:
-void handleArpRequest(char buf[BUFFER_SIZE], struct Interface interface, int packet_socket);
-void handleICMPRequest(char buf[BUFFER_SIZE], struct Interface interface, int packet_socket);
+void handleArpRequest(char buf[BUFFER_SIZE], struct Interface interface);
+void handleICMPRequest(char buf[BUFFER_SIZE], struct Interface interface);
 
 void addIpHeader(unsigned char * buf, unsigned char sourceIp[4], unsigned char destIp[4]);
 void addEthernetHeader(unsigned char * buf, unsigned char dest[6], unsigned char src[6], int ethType);
@@ -114,7 +114,6 @@ int main(int argc, char ** argv) {
 	printf("\n");
 
 	srand(time(NULL));
-	int packet_socket;
 
 	struct Interface myInterface;
 
@@ -159,12 +158,6 @@ int main(int argc, char ** argv) {
 			}
 		}
 
-
-		//Check if this is a packet address, there will be one per
-		//interface.  There are IPv4 and IPv6 as well, but we don't care
-		//about those for the purpose of enumerating interfaces. We can
-		//use the AF_INET addresses in this list for example to get a list
-		//of our own IP addresses
 		//MAC
 		if (tmp->ifa_addr->sa_family == AF_PACKET) {
 			printf("Interface: %s\n", tmp->ifa_name);
@@ -205,32 +198,6 @@ int main(int argc, char ** argv) {
 					}
 				}
 			}
-
-			//create a packet socket on interface r?-eth1
-			//TODO: This should be able to go away since we're now using every interface
-			if (!strncmp(&(tmp->ifa_name[3]), "eth1", 4)) {
-				printf("Creating Socket on interface %s\n", tmp->ifa_name);
-				//create a packet socket
-				//AF_PACKET makes it a packet socket
-				//SOCK_RAW makes it so we get the entire packet
-				//could also use SOCK_DGRAM to cut off link layer header
-				//ETH_P_ALL indicates we want all (upper layer) protocols
-				//we could specify just a specific one
-				packet_socket = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-				if (packet_socket < 0) {
-					perror("socket");
-					return 2;
-				}
-				//Bind the socket to the address, so we only get packets
-				//recieved on this specific interface. For packet sockets, the
-				//address structure is a struct sockaddr_ll (see the man page
-				//for "packet"), but of course bind takes a struct sockaddr.
-				//Here, we can use the sockaddr we got from getifaddrs (which
-				//we could convert to sockaddr_ll if we needed to)
-				if(bind(packet_socket, tmp->ifa_addr, sizeof(struct sockaddr_ll)) == -1){
-					perror("bind");
-				}
-			}
 		}
 	}
 
@@ -259,24 +226,14 @@ int main(int argc, char ** argv) {
 	//free the interface list when we don't need it anymore
 	//freeifaddrs(ifaddr);
 
-	//loop and recieve packets. We are only looking at one interface,
-	//for the project you will probably want to look at more (to do so,
-	//a good way is to have one socket per interface and use select to
-	//see which ones have data)
 	printf("Ready to recieve now\n");
+	int waitingToForward = 0;
 	while (1) {
 		char buf[BUFFER_SIZE];
+		char savedPacket[BUFFER_SIZE];
 		struct sockaddr_ll recvaddr;
 		int recvaddrlen = sizeof(struct sockaddr_ll);
-		//we can use recv, since the addresses are in the packet, but we
-		//use recvfrom because it gives us an easy way to determine if
-		//this packet is incoming or outgoing (when using ETH_P_ALL, we
-		//see packets in both directions. Only outgoing can be seen when
-		//using a packet socket with some specific protocol)
 		int n = recvfrom(myInterface.packet_socket, buf, BUFFER_SIZE, 0, (struct sockaddr*)&recvaddr, &recvaddrlen);
-		//ignore outgoing packets (we can't disable some from being sent
-		//by the OS automatically, for example ICMP port unreachable
-		//messages, so we will just ignore them here)
 		if(recvaddr.sll_pkttype==PACKET_OUTGOING)
 			continue;
 
@@ -287,17 +244,32 @@ int main(int argc, char ** argv) {
 			continue;
 		}
 
-    
-		//what else to do is up to you, you can send packets with send,
-		//just like we used for TCP sockets (or you can use sendto, but it
-		//is not necessary, since the headers, including all addresses,
-		//need to be in the buffer you are sending)
+
+		//Check if arp response
+		unsigned char* arphead = buf + 14;
+		struct arp_header *arpHeader = (struct arp_header *)arphead;
+
+		if (ntohs(arpHeader->arp_op) == 0x02) {
+			printf("Got an arp response.\n");
+			printf("The MAC Address is %02x:%02x:%02x:%02x:%02x:%02x\n", );
+		}
+
+		//Handle forwarding
+		int forwarded = handleForwarding(buf, myInterface);
+		if (forwarded == 1) {
+			waitingToForward = 0;
+			continue;
+		} else if (forwarded == 2) {
+			memcpy(savedPacket, buf, BUFFER_SIZE);
+			waitingToForward = 1;
+			continue;
+		}
 
 		//Handle any arp requests
-		handleArpRequest(buf, myInterface, packet_socket);
+		handleArpRequest(buf, myInterface);
 
 		//Handle any ICMP requests
-		handleICMPRequest(buf, myInterface, packet_socket);
+		handleICMPRequest(buf, myInterface);
 	}
 
 	//exit
@@ -306,9 +278,45 @@ int main(int argc, char ** argv) {
 
 
 //********************************************************************************************************
+//***********************************************  Forwarding  *******************************************
+//********************************************************************************************************
+
+//Returns 1 if forwarded, 0 if not forwarded, 2 if waiting for arp
+int handleForwarding(char buf[BUFFER_SIZE], struct Interface interface) {
+	int i = 0;
+	int didForward;
+	unsigned char* ethhead = (unsigned char*) buf;
+	struct ethhdr *ethernetHeader = (struct ethhdr *) ethhead;
+
+	unsigned char * ipHead = (unsigned char *) buf + 14;
+	struct iphdr * ipHeader = (struct iphdr *) ipHead;
+
+	unsigned char destIp[4];
+	destIp[3] = ipHeader->saddr >> 24;
+	destIp[2] = ipHeader->saddr >> 16;
+	destIp[1] = ipHeader->saddr >> 8;
+	destIp[0] = ipHeader->saddr;
+
+	int equal = 1;
+	for (i = 0; i < 4; i++) {
+		equal &= destIp[i] == interface.ipAddress[i];
+	}
+
+	if (!equal) {
+		//TODO: Create arp request
+		//TODO: Send arp request
+
+		return 1;
+	}
+
+	return 0;
+}
+
+
+//********************************************************************************************************
 //***********************************************  ICMP Functions  ***************************************
 //********************************************************************************************************
-void handleICMPRequest(char buf[BUFFER_SIZE], struct Interface interface, int packet_socket) {
+void handleICMPRequest(char buf[BUFFER_SIZE], struct Interface interface) {
 	int i = 0;
 	unsigned char* ethhead = (unsigned char*) buf;
 	struct ethhdr *ethernetHeader = (struct ethhdr *) ethhead;
@@ -361,7 +369,7 @@ void handleICMPRequest(char buf[BUFFER_SIZE], struct Interface interface, int pa
 
 		printf("Sending ICMP Response. \n");
 
-		send(packet_socket, buffer, ICMP_SIZE, 0);
+		send(interface.packet_socket, buffer, ICMP_SIZE, 0);
 	}
 }
 
@@ -429,7 +437,7 @@ void addICMPHeader(unsigned char * buf, char * data, char id[2], char seq[2]) {
 //********************************************************************************************************
 //********************************************  ARP Functions  *******************************************
 //********************************************************************************************************
-void handleArpRequest(char buf[BUFFER_SIZE], struct Interface interface, int packet_socket) {
+void handleArpRequest(char buf[BUFFER_SIZE], struct Interface interface) {
 	int i = 0;
 
 	//Get ethernet header from the buffer
@@ -449,7 +457,6 @@ void handleArpRequest(char buf[BUFFER_SIZE], struct Interface interface, int pac
 
 		if (ntohs(arpHeader->arp_op) == ARPOP_REQUEST && equal) {
 			printf("Got an arp request.\n");
-			//TODO: Need to check if it's our IP address, otherwise we want to ignore.
 
 			unsigned char buffer[42];
 			for (i = 0; i < 42; i++) {
@@ -460,7 +467,7 @@ void handleArpRequest(char buf[BUFFER_SIZE], struct Interface interface, int pac
 			addArpResponseHeader(buffer, interface.macAddress, arpHeader->arp_sha, arpHeader->arp_dpa, arpHeader->arp_spa);
 
 			printf("Sending arp response. \n");
-			send(packet_socket, buffer, 42, 0);
+			send(interface.packet_socket, buffer, 42, 0);
 		}
 	}
 }
