@@ -18,6 +18,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
+#include <signal.h>
+#include <sys/prctl.h>
 
 #define BUFFER_SIZE 1500
 
@@ -28,18 +30,17 @@
 #define NUM_INTERFACE 10
 
 
-//This was taken from the internet; it's been modified to be in the correct order
-struct __attribute__((packed)) arp_header
-{
-        unsigned short arp_hd;
-        unsigned short arp_pr;
-        unsigned char arp_hdl;
-        unsigned char arp_prl;
-        unsigned short arp_op;
-        unsigned char arp_sha[6];
-        unsigned char arp_spa[4];
+//This was taken from the internet
+struct __attribute__((packed)) arp_header {
+	unsigned short arp_hd;
+	unsigned short arp_pr;
+	unsigned char arp_hdl;
+	unsigned char arp_prl;
+	unsigned short arp_op;
+	unsigned char arp_sha[6];
+	unsigned char arp_spa[4];
 	unsigned char arp_dha[6];
-        unsigned char arp_dpa[4];
+	unsigned char arp_dpa[4];
 
 	//SHA is sender mac
 	//spa is sender ip
@@ -52,34 +53,73 @@ struct Interface {
 	char * name;
 	unsigned char macAddress[6];
 	unsigned char ipAddress[4];
+	int packet_socket;
+};
+
+struct Route {
+	int valid;
+	unsigned char sourceIp[4];
+	int numBytes;
+	int hasIntermediateIp;
+	unsigned char destIp[4];
+	char * interfaceName;
 };
 
 
 //Headers:
-void handleArpRequest(char buf[BUFFER_SIZE], unsigned char myMac[6], unsigned char myIp[4], int packet_socket);
-void handleICMPRequest(char buf[BUFFER_SIZE], unsigned char myMac[6], unsigned char sourceIp[4], int packet_socket);
+void handleArpRequest(char buf[BUFFER_SIZE], struct Interface interface, int packet_socket);
+void handleICMPRequest(char buf[BUFFER_SIZE], struct Interface interface, int packet_socket);
 
 void addIpHeader(unsigned char * buf, unsigned char sourceIp[4], unsigned char destIp[4]);
 void addEthernetHeader(unsigned char * buf, unsigned char dest[6], unsigned char src[6], int ethType);
 void addICMPHeader(unsigned char * buf, char * data, char id[2], char seq[2]);
 void addArpResponseHeader(unsigned char * buf, unsigned char sourceMac[6], unsigned char destMac[6], unsigned char senderIp[4], unsigned char destIp[4]);
 
-unsigned int calculateChecksum(unsigned char * buffer, int size);
-
 void createIPArray(unsigned char * buffer, char * ip);
 
+unsigned int calculateChecksum(unsigned char * buffer, int size);
+
+void processForwardingTable(FILE *file, struct Route routingTable[5]);
 
 
-int main() {
+
+int main(int argc, char ** argv) {
+	if (argc != 2) {
+		printf("You need to specify a routing table for this router.\n");
+		return 0;
+	}
+
+	FILE *file = fopen(argv[1], "r");
+	if (file == NULL) {
+		printf("Invalid file.\n");
+		return 0;
+	}
+
+	struct Route routingTable[5];
+	processForwardingTable(file, routingTable);
+
+	int i;
+	printf("Routing Table: \n");
+	for (i = 0; i <= 5; i++) {
+		if (routingTable[i].valid == 0) {
+			continue;
+		}
+		printf("\tinterfaceName: %s\n", routingTable[i].interfaceName);
+		printf("\tsourceIp: %02x %02x %02x %02x\n", routingTable[i].sourceIp[0], routingTable[i].sourceIp[1], routingTable[i].sourceIp[2], routingTable[i].sourceIp[3]);
+		printf("\tnumBytes: %d\n", routingTable[i].numBytes);
+		printf("\thasIntermediateIp: %d\n", routingTable[i].hasIntermediateIp);
+		printf("\tdestIp: %02x %02x %02x %02x\n", routingTable[i].destIp[0], routingTable[i].destIp[1], routingTable[i].destIp[2], routingTable[i].destIp[3]);
+		printf("\n");
+	}
+	printf("\n");
+
 	srand(time(NULL));
 	int packet_socket;
 
-	unsigned char myMac[6];
-	unsigned char myIp[4];
+	struct Interface myInterface;
 
 	struct Interface interfaces[NUM_INTERFACE];
-	int i;
-		for (i = 0; i < 6; i++) { myMac[i] = 0; }
+	//int i;
 	for (i = 0; i < NUM_INTERFACE; i++) { interfaces[i].valid = 0; }
 
 	//get list of interfaces (actually addresses)
@@ -122,7 +162,7 @@ int main() {
 
 		//Check if this is a packet address, there will be one per
 		//interface.  There are IPv4 and IPv6 as well, but we don't care
-		//about those ICMP_SIZEfor the purpose of enumerating interfaces. We can
+		//about those for the purpose of enumerating interfaces. We can
 		//use the AF_INET addresses in this list for example to get a list
 		//of our own IP addresses
 		//MAC
@@ -140,6 +180,11 @@ int main() {
 				if (interfaces[i].valid == 1 && strcmp(tmp->ifa_name, interfaces[i].name) == 0) {
 					found = 1;
 					memcpy(interfaces[i].macAddress, macAddress, 6);
+					interfaces[i].packet_socket = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+					printf("Creating Socket on interface %s\n", tmp->ifa_name);
+					if(bind(interfaces[i].packet_socket, tmp->ifa_addr, sizeof(struct sockaddr_ll)) == -1){
+						perror("bind");
+					}
 					break;
 				}
 			}
@@ -151,14 +196,18 @@ int main() {
 						interfaces[i].name = (char *)malloc(strlen(tmp->ifa_name) + 1);
 						strcpy(interfaces[i].name, tmp->ifa_name);
 						memcpy(interfaces[i].macAddress, macAddress, 6);
+						interfaces[i].packet_socket = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+						printf("Creating Socket on interface %s\n", tmp->ifa_name);
+						if(bind(interfaces[i].packet_socket, tmp->ifa_addr, sizeof(struct sockaddr_ll)) == -1){
+							perror("bind");
+						}
 						break;
 					}
 				}
 			}
 
 			//create a packet socket on interface r?-eth1
-			//TODO: We need to open connections on the other interfaces as well.
-			//TODO: May need to thread in order to handle this "It's a good idea"
+			//TODO: This should be able to go away since we're now using every interface
 			if (!strncmp(&(tmp->ifa_name[3]), "eth1", 4)) {
 				printf("Creating Socket on interface %s\n", tmp->ifa_name);
 				//create a packet socket
@@ -189,12 +238,20 @@ int main() {
 		if (interfaces[i].valid == 1) {
 			printf("\nInformation for interface %s:\n", interfaces[i].name);
 			printf("\tMAC Address is: %02x:%02x:%02x:%02x:%02x:%02x \n", interfaces[i].macAddress[0], interfaces[i].macAddress[1], interfaces[i].macAddress[2], interfaces[i].macAddress[3], interfaces[i].macAddress[4], interfaces[i].macAddress[5]);
-			printf("\tIP Address is: %d.%d.%d.%d (%02x %02x %02x %02x)\n\n", interfaces[i].ipAddress[0], interfaces[i].ipAddress[1], interfaces[i].ipAddress[2], interfaces[i].ipAddress[3], interfaces[i].ipAddress[0], interfaces[i].ipAddress[1], interfaces[i].ipAddress[2], interfaces[i].ipAddress[3]);
+			printf("\tIP Address is: %d.%d.%d.%d (%02x %02x %02x %02x)\n", interfaces[i].ipAddress[0], interfaces[i].ipAddress[1], interfaces[i].ipAddress[2], interfaces[i].ipAddress[3], interfaces[i].ipAddress[0], interfaces[i].ipAddress[1], interfaces[i].ipAddress[2], interfaces[i].ipAddress[3]);
+			printf("\tPacket Socket is: %d \n\n", interfaces[i].packet_socket);
 
-			if (strncmp(&(interfaces[i].name[3]), "eth1", 4) == 0) {
-				printf("Set myMac\n");
-				memcpy(myMac, interfaces[i].macAddress, 6);
-				memcpy(myIp, interfaces[i].ipAddress, 4);
+
+			//Handle Threading:
+			if (strcmp(interfaces[i].name, "lo") == 0) {
+				continue;
+			}
+
+			pid_t pid = fork();
+			if (pid == 0) {
+				prctl(PR_SET_PDEATHSIG, SIGHUP);
+				myInterface = interfaces[i];
+				break;
 			}
 		}
 	}
@@ -213,10 +270,10 @@ int main() {
 		int recvaddrlen = sizeof(struct sockaddr_ll);
 		//we can use recv, since the addresses are in the packet, but we
 		//use recvfrom because it gives us an easy way to determine if
-		//this packet ICMP_SIZEis incoming or outgoing (when using ETH_P_ALL, we
+		//this packet is incoming or outgoing (when using ETH_P_ALL, we
 		//see packets in both directions. Only outgoing can be seen when
 		//using a packet socket with some specific protocol)
-		int n = recvfrom(packet_socket, buf, BUFFER_SIZE, 0, (struct sockaddr*)&recvaddr, &recvaddrlen);
+		int n = recvfrom(myInterface.packet_socket, buf, BUFFER_SIZE, 0, (struct sockaddr*)&recvaddr, &recvaddrlen);
 		//ignore outgoing packets (we can't disable some from being sent
 		//by the OS automatically, for example ICMP port unreachable
 		//messages, so we will just ignore them here)
@@ -226,6 +283,8 @@ int main() {
 		//start processing all others
 		if (n != -1) {
 			printf("Got a %d byte packet\n", n);
+		} else {
+			continue;
 		}
 
     
@@ -235,10 +294,10 @@ int main() {
 		//need to be in the buffer you are sending)
 
 		//Handle any arp requests
-		handleArpRequest(buf, myMac, myIp, packet_socket);
+		handleArpRequest(buf, myInterface, packet_socket);
 
 		//Handle any ICMP requests
-		handleICMPRequest(buf, myMac, myIp, packet_socket);
+		handleICMPRequest(buf, myInterface, packet_socket);
 	}
 
 	//exit
@@ -249,7 +308,7 @@ int main() {
 //********************************************************************************************************
 //***********************************************  ICMP Functions  ***************************************
 //********************************************************************************************************
-void handleICMPRequest(char buf[BUFFER_SIZE], unsigned char myMac[6], unsigned char sourceIp[4], int packet_socket) {
+void handleICMPRequest(char buf[BUFFER_SIZE], struct Interface interface, int packet_socket) {
 	int i = 0;
 	unsigned char* ethhead = (unsigned char*) buf;
 	struct ethhdr *ethernetHeader = (struct ethhdr *) ethhead;
@@ -296,7 +355,7 @@ void handleICMPRequest(char buf[BUFFER_SIZE], unsigned char myMac[6], unsigned c
 			seq[i] = buf[14 + 20 + 6 + i];
 		}
 
-		addEthernetHeader(buffer, ethernetHeader->h_source, myMac, 0x0800);
+		addEthernetHeader(buffer, ethernetHeader->h_source, interface.macAddress, 0x0800);
 		addIpHeader(buffer, sourceIp, destIp);
 		addICMPHeader(buffer, data, id, seq);
 
@@ -334,12 +393,6 @@ void addIpHeader(unsigned char * buf, unsigned char sourceIp[4], unsigned char d
 	unsigned int checksum = calculateChecksum(buf + 14, 20);
 	buf[14 + 10] = checksum >> 8;
 	buf[14 + 11] = checksum;
-
-	printf("IP Header: ");
-	for (i = 0; i < 20; i++) {
-		printf("%02x ", buf[i + 14]);
-	}
-	printf("\n");
 }
 
 void addICMPHeader(unsigned char * buf, char * data, char id[2], char seq[2]) {
@@ -370,43 +423,31 @@ void addICMPHeader(unsigned char * buf, char * data, char id[2], char seq[2]) {
 	unsigned int checksum = calculateChecksum(buf + 14 + sizeof(struct iphdr), ICMP_SIZE - 14 - 20);
 	buf[14 + sizeof(struct iphdr) + 2] = checksum >> 8;
 	buf[14 + sizeof(struct iphdr) + 3] = checksum;
-
-	printf("ICMP Header: ");
-	for (i = 0; i < 98; i++) {
-		printf("%02x ", buf[i + 14 + sizeof(struct iphdr)]);
-	}
-	printf("\n");
-}
-
-unsigned int calculateChecksum(unsigned char * buffer, int size) {
-	unsigned int checksum = 0;
-	int i;
-
-	for (i = 0; i < size; i += 2) {
-		checksum += ((buffer[i] << 8) + buffer[i + 1]);
-	}
-
-	checksum = (checksum >> 16) + checksum;
-	return (unsigned int)~checksum;
 }
 
 
 //********************************************************************************************************
 //********************************************  ARP Functions  *******************************************
 //********************************************************************************************************
-
-void handleArpRequest(char buf[BUFFER_SIZE], unsigned char myMac[6], unsigned char myIp[4], int packet_socket) {
-	//Get ethernet header from the buffer
+void handleArpRequest(char buf[BUFFER_SIZE], struct Interface interface, int packet_socket) {
 	int i = 0;
+
+	//Get ethernet header from the buffer
 	unsigned char* ethhead = (unsigned char*) buf;
 	struct ethhdr *ethernetHeader = (struct ethhdr *) ethhead;
 
-	//Get arp header from the buffer if we're an arp packet
 	if (ntohs(ethernetHeader->h_proto) == ETH_P_ARP) {
+
+		//Get arp header from the buffer if we're an arp packet
 		unsigned char* arphead = buf + 14;
 		struct arp_header *arpHeader = (struct arp_header *)arphead;
 
-		if (ntohs(arpHeader->arp_op) == ARPOP_REQUEST) {
+		int equal = 1;
+		for (i = 0; i < 4; i++) {
+			equal &= arpHeader->arp_dpa[i] == interface.ipAddress[i];
+		}
+
+		if (ntohs(arpHeader->arp_op) == ARPOP_REQUEST && equal) {
 			printf("Got an arp request.\n");
 			//TODO: Need to check if it's our IP address, otherwise we want to ignore.
 
@@ -415,15 +456,10 @@ void handleArpRequest(char buf[BUFFER_SIZE], unsigned char myMac[6], unsigned ch
 				buffer[i] = 0;
 			}
 
-			addEthernetHeader(buffer, ethernetHeader->h_source, myMac, 0x0806);
-			addArpResponseHeader(buffer, myMac, arpHeader->arp_sha, arpHeader->arp_dpa, arpHeader->arp_spa);
+			addEthernetHeader(buffer, ethernetHeader->h_source, interface.macAddress, 0x0806);
+			addArpResponseHeader(buffer, interface.macAddress, arpHeader->arp_sha, arpHeader->arp_dpa, arpHeader->arp_spa);
 
-			printf("Sending arp response; the buffer is: ");
-			for (i = 0; i < 42; i++) {
-				printf("%02x ", buffer[i]);
-			}
-			printf(" \n");
-
+			printf("Sending arp response. \n");
 			send(packet_socket, buffer, 42, 0);
 		}
 	}
@@ -445,12 +481,6 @@ void addEthernetHeader(unsigned char * buf, unsigned char dest[6], unsigned char
 	for (i = 0; i < sizeof(struct ethhdr); i++) {
 		buf[i] = ethernetBuffer[i];
 	}
-
-	printf("Ethernet Header: ");
-	for (i = 0; i < 14; i++) {
-		printf("%02x ", buf[i]);
-	}
-	printf("\n");
 }
 
 void addArpResponseHeader(unsigned char * buf, unsigned char sourceMac[6], unsigned char destMac[6], unsigned char sourceIp[4], unsigned char destIp[4]) {
@@ -484,27 +514,124 @@ void addArpResponseHeader(unsigned char * buf, unsigned char sourceMac[6], unsig
 	for (i = 0; i < sizeof(struct arp_header); i++) {
 		buf[i + 14] = arpHeaderBuffer[i];
 	}
-
-	printf("Arp Header: ");
-	for (i = 0; i < sizeof(struct arp_header); i++) {
-		printf("%02x ", buf[i + 14]);
-	}
-	printf("\n");
 }
 
 void createIPArray(unsigned char * buffer, char * ip) {
-	char * cpy = (char *) malloc(4);
-
 	char * token;
 	int i = 0;
-	while ((token = strsep(&ip, ".")) != NULL && i < 4) {
+	while ((token = strsep(&ip, ".")) != NULL) {
 		buffer[i] = (unsigned char)atoi(token);
 		i++;
 	}
 }
 
 
+//***************************************************************************
+//********************* Helper Functions ************************************
+//***************************************************************************
+unsigned int calculateChecksum(unsigned char * buffer, int size) {
+	unsigned int checksum = 0;
+	int i;
 
+	for (i = 0; i < size; i += 2) {
+		checksum += ((buffer[i] << 8) + buffer[i + 1]);
+	}
+
+	checksum = (checksum >> 16) + checksum;
+	return (unsigned int)~checksum;
+}
+
+struct Interface getInterfaceFromName(char * name, struct Interface interfaces[NUM_INTERFACE]) {
+	struct Interface NULL_STRUCT = {.valid = 0};	
+	int i;
+	for (i = 0; i < NUM_INTERFACE; i++) {
+		if (strcmp(name, interfaces[i].name) == 0) {
+			return interfaces[i];
+		}
+	}
+	return NULL_STRUCT;
+}
+
+struct Interface getInterfaceFromIp(unsigned char ip[4], struct Interface interfaces[NUM_INTERFACE]) {
+	struct Interface NULL_STRUCT = {.valid = 0};	
+	int i, j;
+	for (i = 0; i < NUM_INTERFACE; i++) {
+		int equal = 1;
+		for (j = 0; j < 4; j++) {
+			equal &= interfaces[i].ipAddress[j] == ip[j];
+		}
+		if (equal) {
+			return interfaces[i];
+		}
+	}
+	return NULL_STRUCT;
+}
+
+struct Interface getInterfaceFromMac(unsigned char mac[6], struct Interface interfaces[NUM_INTERFACE]) {
+	struct Interface NULL_STRUCT = {.valid = 0};
+	int i, j;
+	for (i = 0; i < NUM_INTERFACE; i++) {
+		int equal = 1;
+		for (j = 0; j < 6; j++) {
+			equal &= interfaces[i].macAddress[j] == mac[j];
+		}
+		if (equal) {
+			return interfaces[i];
+		}
+	}
+	return NULL_STRUCT;
+}
+
+void processForwardingTable(FILE *file, struct Route routingTable[5]) {
+	int i;
+	for (i = 0; i <= 5; i++) {
+		routingTable[i].valid = 0;
+	}
+	char line[256];
+	char * token;
+	char * subToken;
+	int currentRoute = 0;
+	while(fgets(line, 256, file)) {
+		int i = 0;
+		char * lineCpy = line;
+		routingTable[currentRoute].valid = 1;
+		while ((token = strsep(&lineCpy, " ")) != NULL) {
+			int j = 0;
+			if (i == 0) {
+				while ((subToken = strsep(&token, "/")) != NULL) {
+					if (j == 0) {
+						unsigned char tempIp[4];
+						createIPArray(tempIp, subToken);
+						memcpy(routingTable[i].sourceIp, tempIp, 4);
+					} else {
+						routingTable[i].numBytes = atoi(subToken);
+					}
+					j++;
+				}
+			}
+
+			if (i == 1 && strcmp(token, "-") == 0) {
+				printf("i is 1, token is -, sanity: %s\n", token);
+				routingTable[currentRoute].hasIntermediateIp = 0;
+			} else if (i == 1) {
+				routingTable[currentRoute].hasIntermediateIp = 1;
+				unsigned char tempIp[4];
+				createIPArray(tempIp, token);
+				printf("i is 1, token is not -, sanity: %s\n", token);
+				printf("Temp ip %02x %02x %02x %02x\n", tempIp[0], tempIp[1], tempIp[2], tempIp[3]);
+				memcpy(routingTable[i].destIp, tempIp, 4);
+			}
+
+			if (i == 2) {
+				routingTable[currentRoute].interfaceName = (char *)malloc(strlen(token) - 1);
+				strncpy(routingTable[currentRoute].interfaceName, token, strlen(token) - 1);
+			}
+			i++;
+		}
+		currentRoute++;
+	}
+	fclose(file);
+}
 
 
 
