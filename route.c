@@ -602,9 +602,9 @@ void processForwardingTable(FILE *file, struct Route routingTable[5]) {
 					if (j == 0) {
 						unsigned char tempIp[4];
 						createIPArray(tempIp, subToken);
-						memcpy(routingTable[i].sourceIp, tempIp, 4);
+						memcpy(routingTable[currentRoute].sourceIp, tempIp, 4);
 					} else {
-						routingTable[i].numBytes = atoi(subToken);
+						routingTable[currentRoute].numBytes = atoi(subToken);
 					}
 					j++;
 				}
@@ -619,7 +619,7 @@ void processForwardingTable(FILE *file, struct Route routingTable[5]) {
 				createIPArray(tempIp, token);
 				printf("i is 1, token is not -, sanity: %s\n", token);
 				printf("Temp ip %02x %02x %02x %02x\n", tempIp[0], tempIp[1], tempIp[2], tempIp[3]);
-				memcpy(routingTable[i].destIp, tempIp, 4);
+				memcpy(routingTable[currentRoute].destIp, tempIp, 4);
 			}
 
 			if (i == 2) {

@@ -101,7 +101,6 @@ int main(int argc, char ** argv) {
 	int i;
 	printf("Routing Table: \n");
 	for (i = 0; i <= 5; i++) {
-		printf("\tvalid: %d\n", routingTable[i].valid);
 		if (routingTable[i].valid == 0) {
 			continue;
 		}
@@ -603,9 +602,9 @@ void processForwardingTable(FILE *file, struct Route routingTable[5]) {
 					if (j == 0) {
 						unsigned char tempIp[4];
 						createIPArray(tempIp, subToken);
-						memcpy(routingTable[i].sourceIp, tempIp, 4);
+						memcpy(routingTable[currentRoute].sourceIp, tempIp, 4);
 					} else {
-						routingTable[i].numBytes = atoi(subToken);
+						routingTable[currentRoute].numBytes = atoi(subToken);
 					}
 					j++;
 				}
