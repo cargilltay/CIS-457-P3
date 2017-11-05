@@ -67,19 +67,23 @@ struct Route {
 
 
 //Headers:
+struct Route handleForwarding(char buf[BUFFER_SIZE], struct Interface interface, struct Route routingTable[5]);
 void handleArpRequest(char buf[BUFFER_SIZE], struct Interface interface);
 void handleICMPRequest(char buf[BUFFER_SIZE], struct Interface interface);
 
 void addIpHeader(unsigned char * buf, unsigned char sourceIp[4], unsigned char destIp[4]);
 void addEthernetHeader(unsigned char * buf, unsigned char dest[6], unsigned char src[6], int ethType);
 void addICMPHeader(unsigned char * buf, char * data, char id[2], char seq[2]);
-void addArpResponseHeader(unsigned char * buf, unsigned char sourceMac[6], unsigned char destMac[6], unsigned char senderIp[4], unsigned char destIp[4]);
+void addArpResponseHeader(unsigned char * buf, unsigned char sourceMac[6], unsigned char destMac[6], 		unsigned char sourceIp[4], unsigned char destIp[4], int arpOp);
+void buildArpRequest(unsigned char * buf, struct Interface interface, struct Route route);
 
 void createIPArray(unsigned char * buffer, char * ip);
 
 unsigned int calculateChecksum(unsigned char * buffer, int size);
 
 void processForwardingTable(FILE *file, struct Route routingTable[5]);
+
+struct Interface getInterfaceFromName(char * name, struct Interface interfaces[NUM_INTERFACE]);
 
 
 
@@ -251,20 +255,19 @@ int main(int argc, char ** argv) {
 
 		if (ntohs(arpHeader->arp_op) == 0x02) {
 			printf("Got an arp response.\n");
-			printf("The MAC Address is %02x:%02x:%02x:%02x:%02x:%02x\n", );
+			printf("The MAC Address is %02x:%02x:%02x:%02x:%02x:%02x\n", arpHeader->arp_sha[0], arpHeader->arp_sha[1], arpHeader->arp_sha[2], arpHeader->arp_sha[3], arpHeader->arp_sha[4], arpHeader->arp_sha[5]);
+			continue;
 		}
 
 		//Handle forwarding
-		int forwarded = handleForwarding(buf, myInterface);
-		if (forwarded == 1) {
-			waitingToForward = 0;
-			continue;
-		} else if (forwarded == 2) {
-			memcpy(savedPacket, buf, BUFFER_SIZE);
-			waitingToForward = 1;
+		struct Route route = handleForwarding(buf, myInterface, routingTable);
+		if (route.valid == 1) {
+			struct Interface routeInterface = getInterfaceFromName(route.interfaceName, interfaces);
+			printf("Going to build arp for interface %s\n", route.interfaceName);
+			buildArpRequest(buf, routeInterface, route);
 			continue;
 		}
-
+		
 		//Handle any arp requests
 		handleArpRequest(buf, myInterface);
 
@@ -282,7 +285,7 @@ int main(int argc, char ** argv) {
 //********************************************************************************************************
 
 //Returns 1 if forwarded, 0 if not forwarded, 2 if waiting for arp
-int handleForwarding(char buf[BUFFER_SIZE], struct Interface interface) {
+struct Route handleForwarding(char buf[BUFFER_SIZE], struct Interface interface, struct Route routingTable[5]) {
 	int i = 0;
 	int didForward;
 	unsigned char* ethhead = (unsigned char*) buf;
@@ -292,24 +295,40 @@ int handleForwarding(char buf[BUFFER_SIZE], struct Interface interface) {
 	struct iphdr * ipHeader = (struct iphdr *) ipHead;
 
 	unsigned char destIp[4];
-	destIp[3] = ipHeader->saddr >> 24;
-	destIp[2] = ipHeader->saddr >> 16;
-	destIp[1] = ipHeader->saddr >> 8;
-	destIp[0] = ipHeader->saddr;
+	destIp[3] = ipHeader->daddr >> 24;
+	destIp[2] = ipHeader->daddr >> 16;
+	destIp[1] = ipHeader->daddr >> 8;
+	destIp[0] = ipHeader->daddr;
+
+	struct Route route = {.valid = 0};
 
 	int equal = 1;
 	for (i = 0; i < 4; i++) {
 		equal &= destIp[i] == interface.ipAddress[i];
 	}
 
-	if (!equal) {
-		//TODO: Create arp request
-		//TODO: Send arp request
-
-		return 1;
+	printf("Is destIp our ip? %d\n", equal);
+	if (equal) {
+		return route;
 	}
 
-	return 0;
+	int j;
+	for (i = 0; i < 5; i++) {
+		if (routingTable[i].valid == 1) {
+			int equal = 1;
+			for (j = 0; j < (routingTable[i].numBytes / 8); j++) {
+				equal &= destIp[j] == routingTable[i].sourceIp[j];
+			}
+
+			if (equal) {
+				printf("We found a route.\n");
+				route = routingTable[i];
+				break;
+			}
+		}
+	}
+
+	return route;
 }
 
 
@@ -464,12 +483,49 @@ void handleArpRequest(char buf[BUFFER_SIZE], struct Interface interface) {
 			}
 
 			addEthernetHeader(buffer, ethernetHeader->h_source, interface.macAddress, 0x0806);
-			addArpResponseHeader(buffer, interface.macAddress, arpHeader->arp_sha, arpHeader->arp_dpa, arpHeader->arp_spa);
+			addArpResponseHeader(buffer, interface.macAddress, arpHeader->arp_sha, arpHeader->arp_dpa, arpHeader->arp_spa, 0x02);
 
 			printf("Sending arp response. \n");
 			send(interface.packet_socket, buffer, 42, 0);
 		}
 	}
+}
+
+void buildArpRequest(unsigned char * buf, struct Interface interface, struct Route route) {
+	unsigned char* ethhead = (unsigned char*) buf;
+	struct ethhdr *ethernetHeader = (struct ethhdr *) ethhead;
+
+	unsigned char * ipHead = (unsigned char *) buf + 14;
+	struct iphdr * ipHeader = (struct iphdr *) ipHead;
+
+	unsigned char buffer[42];
+	int i;
+	for (i = 0; i < 42; i++) {
+		buffer[i] = 0;
+	}
+
+	unsigned char ethDestMac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+	unsigned char arpDestMac[6] = {0, 0, 0, 0, 0, 0};
+
+	unsigned char destIp[4];
+	if (route.hasIntermediateIp == 1) {
+		memcpy(destIp, route.destIp, 4);
+	} else {
+		destIp[3] = ipHeader->daddr >> 24;
+		destIp[2] = ipHeader->daddr >> 16;
+		destIp[1] = ipHeader->daddr >> 8;
+		destIp[0] = ipHeader->daddr;
+	}
+
+	addEthernetHeader(buffer, ethDestMac, interface.macAddress, 0x0806);
+	addArpResponseHeader(buffer, interface.macAddress, arpDestMac, interface.ipAddress, destIp, 0x01);
+
+	printf("Sending arp request with data:\n");
+	for (i = 0; i < 42; i++) {
+		printf("%02x ", buffer[i]);
+	}
+	printf("\n");
+	send(interface.packet_socket, buffer, 42, 0);
 }
 
 void addEthernetHeader(unsigned char * buf, unsigned char dest[6], unsigned char src[6], int ethType) {
@@ -490,7 +546,7 @@ void addEthernetHeader(unsigned char * buf, unsigned char dest[6], unsigned char
 	}
 }
 
-void addArpResponseHeader(unsigned char * buf, unsigned char sourceMac[6], unsigned char destMac[6], unsigned char sourceIp[4], unsigned char destIp[4]) {
+void addArpResponseHeader(unsigned char * buf, unsigned char sourceMac[6], unsigned char destMac[6], unsigned char sourceIp[4], unsigned char destIp[4], int arpOp) {
 	int i;
 	unsigned char* arphead = buf + 14;
 
@@ -506,7 +562,7 @@ void addArpResponseHeader(unsigned char * buf, unsigned char sourceMac[6], unsig
 	arpHeader->arp_hdl = 0x6;
 	arpHeader->arp_prl = 0x4;
 
-	arpHeader->arp_op = htons(0x02);
+	arpHeader->arp_op = htons(arpOp);
 	for (i = 0; i < 4; i++) {
 		arpHeader->arp_spa[i] = sourceIp[i];
 		arpHeader->arp_dpa[i] = destIp[i];
