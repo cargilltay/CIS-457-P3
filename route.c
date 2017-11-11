@@ -54,6 +54,9 @@ struct Interface {
 	unsigned char macAddress[6];
 	unsigned char ipAddress[4];
 	int packet_socket;
+	int hasSavedPacket;
+	unsigned char savedPacket[BUFFER_SIZE];
+	int savedPacketLength;
 };
 
 struct Route {
@@ -67,7 +70,7 @@ struct Route {
 
 
 //Headers:
-struct Route handleForwarding(char buf[BUFFER_SIZE], struct Interface interface, struct Route routingTable[5]);
+struct Route handleForwarding(unsigned char * buf, struct Interface interface, struct Route routingTable[5]);
 void handleArpRequest(char buf[BUFFER_SIZE], struct Interface interface);
 void handleICMPRequest(char buf[BUFFER_SIZE], struct Interface interface);
 
@@ -231,10 +234,8 @@ int main(int argc, char ** argv) {
 	//freeifaddrs(ifaddr);
 
 	printf("Ready to recieve now\n");
-	int waitingToForward = 0;
 	while (1) {
 		char buf[BUFFER_SIZE];
-		char savedPacket[BUFFER_SIZE];
 		struct sockaddr_ll recvaddr;
 		int recvaddrlen = sizeof(struct sockaddr_ll);
 		int n = recvfrom(myInterface.packet_socket, buf, BUFFER_SIZE, 0, (struct sockaddr*)&recvaddr, &recvaddrlen);
@@ -256,6 +257,28 @@ int main(int argc, char ** argv) {
 		if (ntohs(arpHeader->arp_op) == 0x02) {
 			printf("Got an arp response.\n");
 			printf("The MAC Address is %02x:%02x:%02x:%02x:%02x:%02x\n", arpHeader->arp_sha[0], arpHeader->arp_sha[1], arpHeader->arp_sha[2], arpHeader->arp_sha[3], arpHeader->arp_sha[4], arpHeader->arp_sha[5]);
+			struct Interface routeInterface;
+			for (i = 0; i < NUM_INTERFACE; i++) {
+				if (interfaces[i].hasSavedPacket == 1) {
+					//TODO: Reset interface info
+					interfaces[i].hasSavedPacket = 0;
+					routeInterface = interfaces[i];
+				}
+			}
+
+			//TODO: This is fucked
+			unsigned char savedPacket[BUFFER_SIZE];
+			memcpy(savedPacket, routeInterface.savedPacket, BUFFER_SIZE);
+			int update = updatePacketInfo(savedPacket, arpHeader->arp_dha, arpHeader->arp_sha);
+			if (update == 1) {
+				printf("Forwarding packet on interface %s:\n", routeInterface.name);
+				for (i = 0; i < 42; i++) {
+					printf("%02x ", savedPacket[i]);
+				}
+				printf("\n");
+				send(routeInterface.packet_socket, savedPacket, routeInterface.savedPacketLength, 0);
+			} // Else ignore packet because TTL is dead
+
 			continue;
 		}
 
@@ -263,6 +286,9 @@ int main(int argc, char ** argv) {
 		struct Route route = handleForwarding(buf, myInterface, routingTable);
 		if (route.valid == 1) {
 			struct Interface routeInterface = getInterfaceFromName(route.interfaceName, interfaces);
+			memcpy(routeInterface.savedPacket, buf, BUFFER_SIZE);
+			routeInterface.savedPacketLength = n;
+			routeInterface.hasSavedPacket = 1;
 			printf("Going to build arp for interface %s\n", route.interfaceName);
 			buildArpRequest(buf, routeInterface, route);
 			continue;
@@ -284,8 +310,7 @@ int main(int argc, char ** argv) {
 //***********************************************  Forwarding  *******************************************
 //********************************************************************************************************
 
-//Returns 1 if forwarded, 0 if not forwarded, 2 if waiting for arp
-struct Route handleForwarding(char buf[BUFFER_SIZE], struct Interface interface, struct Route routingTable[5]) {
+struct Route handleForwarding(unsigned char * buf, struct Interface interface, struct Route routingTable[5]) {
 	int i = 0;
 	int didForward;
 	unsigned char* ethhead = (unsigned char*) buf;
@@ -294,6 +319,20 @@ struct Route handleForwarding(char buf[BUFFER_SIZE], struct Interface interface,
 	unsigned char * ipHead = (unsigned char *) buf + 14;
 	struct iphdr * ipHeader = (struct iphdr *) ipHead;
 
+	char bufCpy[BUFFER_SIZE];
+	memcpy(bufCpy, buf, BUFFER_SIZE);
+	//Sets the checksum bytes to 0 so we can do the calculation
+	int offset = 10;
+	bufCpy[14 + offset] = 0;
+	bufCpy[14 + offset + 1] = 0;
+
+	unsigned int calculatedChecksum = calculateChecksum(bufCpy + 14, sizeof(struct iphdr));
+	unsigned char calcCheck[2];
+	calcCheck[0] = calculatedChecksum >> 8;
+	calcCheck[1] = calculatedChecksum;
+
+	printf("Our checksum: %x-%x, their checksum: %x-%x\n", calcCheck[0], calcCheck[1], buf[14 + offset], buf[14 + offset + 1]);
+	
 	unsigned char destIp[4];
 	destIp[3] = ipHeader->daddr >> 24;
 	destIp[2] = ipHeader->daddr >> 16;
@@ -301,6 +340,16 @@ struct Route handleForwarding(char buf[BUFFER_SIZE], struct Interface interface,
 	destIp[0] = ipHeader->daddr;
 
 	struct Route route = {.valid = 0};
+
+	int checkEqual = 1;
+	for (i = 0; i < 2; i++) {
+		checkEqual &= calcCheck[i] == buf[14 + offset + i];
+	}
+
+	if (!checkEqual) {
+		printf("Checksums are not equal.\n");
+		return route;
+	}
 
 	int equal = 1;
 	for (i = 0; i < 4; i++) {
@@ -331,6 +380,39 @@ struct Route handleForwarding(char buf[BUFFER_SIZE], struct Interface interface,
 	return route;
 }
 
+//Returns 1 if successful, return 0 if not
+int updatePacketInfo(unsigned char * buf, unsigned char sourceMac[6], unsigned char destMac[6]) {
+	int i = 0;
+	unsigned char* ethhead = (unsigned char*) buf;
+	struct ethhdr *ethernetHeader = (struct ethhdr *) ethhead;
+
+	unsigned char * ipHead = (unsigned char *) buf + 14;
+	struct iphdr * ipHeader = (struct iphdr *) ipHead;
+
+	if (ipHeader->ttl == 1) {
+		return 0;
+	}
+	ipHeader->ttl = ipHeader->ttl - 1;
+	//TODO: Calculate checksum
+
+	for (i = 0; i < 6; i++) {
+		ethernetHeader->h_dest[i] = destMac[i];
+		ethernetHeader->h_source[i] = sourceMac[i]; 
+	}
+
+	unsigned char * ethernetRaw = (unsigned char *) ethernetHeader;
+	unsigned char * ipRaw = (unsigned char *) ipHeader;
+	for (i = 0; i < 14; i++) {
+		buf[i] = ethernetRaw[i];
+	}
+
+	for (i = 14; i < 14 + 20; i++) {
+		buf[i] = ipRaw[i];
+	}
+
+	return 1;
+}
+
 
 //********************************************************************************************************
 //***********************************************  ICMP Functions  ***************************************
@@ -345,6 +427,8 @@ void handleICMPRequest(char buf[BUFFER_SIZE], struct Interface interface) {
 
 	unsigned char * icmpHead = (unsigned char *) buf + 14 + sizeof(struct iphdr);
 	struct icmphdr * icmpHeader = (struct icmphdr *) icmpHead;
+
+	//TODO: Do we need to check if the IP is ours?
 
 	//0x08 is an echo request
 	if (icmpHeader->type == 0x8) {
