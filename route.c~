@@ -18,11 +18,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
-
-//TODO: May need to delete this if pthread works
-#include <signal.h>
-#include <sys/prctl.h>
-
 #include <pthread.h>
 
 #define BUFFER_SIZE 1500
@@ -81,8 +76,9 @@ void handleICMPRequest(char buf[BUFFER_SIZE], struct Interface interface);
 void addIpHeader(unsigned char * buf, unsigned char sourceIp[4], unsigned char destIp[4]);
 void addEthernetHeader(unsigned char * buf, unsigned char dest[6], unsigned char src[6], int ethType);
 void addICMPHeader(unsigned char * buf, char * data, char id[2], char seq[2]);
-void addArpResponseHeader(unsigned char * buf, unsigned char sourceMac[6], unsigned char destMac[6], 		unsigned char sourceIp[4], unsigned char destIp[4], int arpOp);
+void addArpResponseHeader(unsigned char * buf, unsigned char sourceMac[6], unsigned char destMac[6], unsigned char sourceIp[4], unsigned char destIp[4], int arpOp);
 void buildArpRequest(unsigned char * buf, struct Interface interface, struct Route route);
+void sendDestinationUnreachable(unsigned char * buf, struct Interface interface, int icmpType, int icmpCode);
 
 void createIPArray(unsigned char * buffer, char * ip);
 
@@ -91,6 +87,8 @@ unsigned int calculateChecksum(unsigned char * buffer, int size);
 void processForwardingTable(FILE *file, struct Route routingTable[5]);
 
 struct Interface getInterfaceFromName(char * name, struct Interface interfaces[NUM_INTERFACE]);
+
+void * loop(void * myInterface);
 
 
 
@@ -129,7 +127,6 @@ int main(int argc, char ** argv) {
 	srand(time(NULL));
 
 	struct Interface myInterface;
-	//int i;
 	for (i = 0; i < NUM_INTERFACE; i++) { interfaces[i].valid = 0; }
 
 	//get list of interfaces (actually addresses)
@@ -221,19 +218,14 @@ int main(int argc, char ** argv) {
 
 
 			//Handle Threading:
-			if (strcmp(interfaces[i].name, "lo") == 0) {
+			if (i == 0) {
 				continue;
 			}
 
-			//pid_t pid = fork();
 			pthread_t pid;
-			if (pthread_create(&pid, NULL, NULL, NULL)) {
-
-			}
-			if (pid == 0) {
-				prctl(PR_SET_PDEATHSIG, SIGHUP);
-				myInterface = interfaces[i];
-				break;
+			if (pthread_create(&pid, NULL, loop, &interfaces[i])) {
+				fprintf(stderr, "Error creating thread.\n");
+				return 1;
 			}
 		}
 	}
@@ -241,7 +233,22 @@ int main(int argc, char ** argv) {
 	//free the interface list when we don't need it anymore
 	//freeifaddrs(ifaddr);
 
-	printf("Ready to recieve now\n");
+	while(1);
+
+	//exit
+	return 0;
+}
+
+
+void * loop(void * interface) {
+	int i;
+	struct Interface * myInterface1;
+	struct Interface myInterface;
+	myInterface1 = (struct Interface *)interface;
+	myInterface = *myInterface1;
+	printf("Ready to recieve now on interface %s\n", myInterface.name);
+	int waitingForArp = 0;
+	int arpWaitCount = 0;
 	while (1) {
 		char buf[BUFFER_SIZE];
 		struct sockaddr_ll recvaddr;
@@ -249,10 +256,9 @@ int main(int argc, char ** argv) {
 		int n = recvfrom(myInterface.packet_socket, buf, BUFFER_SIZE, 0, (struct sockaddr*)&recvaddr, &recvaddrlen);
 		if(recvaddr.sll_pkttype==PACKET_OUTGOING)
 			continue;
-
 		//start processing all others
 		if (n != -1) {
-			printf("Got a %d byte packet\n", n);
+			printf("Got a %d byte packet on interface %s\n", n, myInterface.name);
 		} else {
 			continue;
 		}
@@ -263,6 +269,7 @@ int main(int argc, char ** argv) {
 		struct arp_header *arpHeader = (struct arp_header *)arphead;
 
 		if (ntohs(arpHeader->arp_op) == 0x02) {
+			waitingForArp = 0;
 			printf("Got an arp response.\n");
 			printf("The MAC Address is %02x:%02x:%02x:%02x:%02x:%02x\n", arpHeader->arp_sha[0], arpHeader->arp_sha[1], arpHeader->arp_sha[2], arpHeader->arp_sha[3], arpHeader->arp_sha[4], arpHeader->arp_sha[5]);
 			struct Interface routeInterface;
@@ -292,9 +299,24 @@ int main(int argc, char ** argv) {
 			continue;
 		}
 
+		if (waitingForArp == 1 && arpWaitCount < 3) {
+			arpWaitCount++;
+		} else if (waitingForArp == 1) {
+			arpWaitCount = 0;
+			struct Interface routeInterface;
+			for (i = 0; i < NUM_INTERFACE; i++) {
+				if (interfaces[i].hasSavedPacket == 1) {
+					routeInterface = interfaces[i];
+				}
+			}
+
+			sendDestinationUnreachable(buf, routeInterface, 0x03, 0x01);
+		}
+
 		//Handle forwarding
 		struct Route route = handleForwarding(buf, myInterface, routingTable);
 		if (route.valid == 1) {
+			waitingForArp = 1;
 			struct Interface routeInterface = getInterfaceFromName(route.interfaceName, interfaces);
 
 			for (i = 0; i < NUM_INTERFACE; i++) {
@@ -318,9 +340,6 @@ int main(int argc, char ** argv) {
 		//Handle any ICMP requests
 		handleICMPRequest(buf, myInterface);
 	}
-
-	//exit
-	return 0;
 }
 
 
@@ -380,6 +399,7 @@ struct Route handleForwarding(unsigned char * buf, struct Interface interface, s
 	}
 
 	int j;
+	int found = 0;
 	for (i = 0; i < 5; i++) {
 		if (routingTable[i].valid == 1) {
 			int equal = 1;
@@ -390,9 +410,14 @@ struct Route handleForwarding(unsigned char * buf, struct Interface interface, s
 			if (equal) {
 				printf("We found a route.\n");
 				route = routingTable[i];
+				found = 1;
 				break;
 			}
 		}
+	}
+
+	if (!found) {
+		sendDestinationUnreachable(buf, interface, 0x03, 0x00);
 	}
 
 	return route;
@@ -412,21 +437,13 @@ int updatePacketInfo(unsigned char * buf, unsigned char sourceMac[6], unsigned c
 		return 0;
 	}
 	ipHeader->ttl = ipHeader->ttl - 1;
-	//TODO: Calculate checksum
+	ipHeader->check = 0;
+	unsigned int checksum = calculateChecksum(buf + 14, 20);
+	ipHeader->check = htons(checksum);
 
 	for (i = 0; i < 6; i++) {
 		ethernetHeader->h_dest[i] = destMac[i];
 		ethernetHeader->h_source[i] = sourceMac[i]; 
-	}
-
-	unsigned char * ethernetRaw = (unsigned char *) ethernetHeader;
-	unsigned char * ipRaw = (unsigned char *) ipHeader;
-	for (i = 0; i < 14; i++) {
-		buf[i] = ethernetRaw[i];
-	}
-
-	for (i = 14; i < 14 + 20; i++) {
-		buf[i] = ipRaw[i];
 	}
 
 	return 1;
@@ -553,6 +570,60 @@ void addICMPHeader(unsigned char * buf, char * data, char id[2], char seq[2]) {
 	unsigned int checksum = calculateChecksum(buf + 14 + sizeof(struct iphdr), ICMP_SIZE - 14 - 20);
 	buf[14 + sizeof(struct iphdr) + 2] = checksum >> 8;
 	buf[14 + sizeof(struct iphdr) + 3] = checksum;
+}
+
+void sendDestinationUnreachable(unsigned char * buf, struct Interface interface, int icmpType, int icmpCode) {
+	printf("Sending Destination unreachable.\n");
+	int i = 0;
+	unsigned char* ethhead = (unsigned char*) buf;
+	struct ethhdr *ethernetHeader = (struct ethhdr *) ethhead;
+
+	unsigned char * ipHead = (unsigned char *) buf + 14;
+	struct iphdr * ipHeader = (struct iphdr *) ipHead;
+
+	unsigned char * icmpHead = (unsigned char *) buf + 14 + sizeof(struct iphdr);
+	struct icmphdr * icmpHeader = (struct icmphdr *) icmpHead;
+
+	int dataSize = sizeof(struct iphdr) + 8;
+	unsigned char icmpError[dataSize];
+
+	for (i = 0; i < dataSize; i++) {
+		icmpError[i] = buf[14 + i];
+	}
+
+	unsigned char destMac[6];
+	memcpy(destMac, ethernetHeader->h_source, 6);
+	memcpy(ethernetHeader->h_source, ethernetHeader->h_dest, 6);
+	memcpy(ethernetHeader->h_dest, destMac, 6);
+
+	unsigned char destIp[4];
+	destIp[3] = ipHeader->saddr >> 24;
+	destIp[2] = ipHeader->saddr >> 16;
+	destIp[1] = ipHeader->saddr >> 8;
+	destIp[0] = ipHeader->saddr;
+
+	unsigned char sourceIp[4];
+	sourceIp[3] = ipHeader->daddr >> 24;
+	sourceIp[2] = ipHeader->daddr >> 16;
+	sourceIp[1] = ipHeader->daddr >> 8;
+	sourceIp[0] = ipHeader->daddr;
+	
+	addIpHeader(buf, sourceIp, destIp);
+	
+	buf[14 + 20] = icmpType;
+	buf[14 + 20 + 1] = icmpCode;
+	buf[14 + 20 + 2] = 0;
+	buf[14 + 20 + 3] = 0;
+
+	for (i = 0; i < dataSize; i++) {
+		buf[14 + 20 + 4 + i] = icmpError[i];
+	}
+
+	unsigned int checksum = calculateChecksum(buf + 14 + 20, 4 + dataSize);
+	buf[14 + 20 + 2] = checksum >> 8;
+	buf[14 + 20 + 3] = checksum;
+
+	send(interface.packet_socket, buf, 14 + 20 + 4 + dataSize, 0);
 }
 
 
