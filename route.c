@@ -18,8 +18,12 @@
 #include <string.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
+
+//TODO: May need to delete this if pthread works
 #include <signal.h>
 #include <sys/prctl.h>
+
+#include <pthread.h>
 
 #define BUFFER_SIZE 1500
 
@@ -90,6 +94,9 @@ struct Interface getInterfaceFromName(char * name, struct Interface interfaces[N
 
 
 
+struct Route routingTable[5];
+struct Interface interfaces[NUM_INTERFACE];
+
 int main(int argc, char ** argv) {
 	if (argc != 2) {
 		printf("You need to specify a routing table for this router.\n");
@@ -102,7 +109,6 @@ int main(int argc, char ** argv) {
 		return 0;
 	}
 
-	struct Route routingTable[5];
 	processForwardingTable(file, routingTable);
 
 	int i;
@@ -123,8 +129,6 @@ int main(int argc, char ** argv) {
 	srand(time(NULL));
 
 	struct Interface myInterface;
-
-	struct Interface interfaces[NUM_INTERFACE];
 	//int i;
 	for (i = 0; i < NUM_INTERFACE; i++) { interfaces[i].valid = 0; }
 
@@ -259,18 +263,20 @@ int main(int argc, char ** argv) {
 			printf("The MAC Address is %02x:%02x:%02x:%02x:%02x:%02x\n", arpHeader->arp_sha[0], arpHeader->arp_sha[1], arpHeader->arp_sha[2], arpHeader->arp_sha[3], arpHeader->arp_sha[4], arpHeader->arp_sha[5]);
 			struct Interface routeInterface;
 			for (i = 0; i < NUM_INTERFACE; i++) {
+				printf("Interface %s hasSavedPacket is %d.\n", interfaces[i].name, interfaces[i].hasSavedPacket);
 				if (interfaces[i].hasSavedPacket == 1) {
-					//TODO: Reset interface info
+					printf("Using interface %s\n.", interfaces[i].name);
 					interfaces[i].hasSavedPacket = 0;
 					routeInterface = interfaces[i];
 				}
 			}
 
-			//TODO: This is fucked
+			printf("After For loop.\n");
+
 			unsigned char savedPacket[BUFFER_SIZE];
 			memcpy(savedPacket, routeInterface.savedPacket, BUFFER_SIZE);
 			int update = updatePacketInfo(savedPacket, arpHeader->arp_dha, arpHeader->arp_sha);
-			if (update == 1) {
+			if (update) {
 				printf("Forwarding packet on interface %s:\n", routeInterface.name);
 				for (i = 0; i < 42; i++) {
 					printf("%02x ", savedPacket[i]);
@@ -286,9 +292,17 @@ int main(int argc, char ** argv) {
 		struct Route route = handleForwarding(buf, myInterface, routingTable);
 		if (route.valid == 1) {
 			struct Interface routeInterface = getInterfaceFromName(route.interfaceName, interfaces);
-			memcpy(routeInterface.savedPacket, buf, BUFFER_SIZE);
-			routeInterface.savedPacketLength = n;
-			routeInterface.hasSavedPacket = 1;
+
+			for (i = 0; i < NUM_INTERFACE; i++) {
+				if (interfaces[i].packet_socket == routeInterface.packet_socket) {
+					printf("Setting packet info on the interface.\n");
+					interfaces[i].savedPacketLength = n;
+					interfaces[i].hasSavedPacket = 1;
+					printf("Interface %s hasSavedPacket is %d.\n", interfaces[i].name, interfaces[i].hasSavedPacket);
+					memcpy(interfaces[i].savedPacket, buf, BUFFER_SIZE);
+				}
+			}
+
 			printf("Going to build arp for interface %s\n", route.interfaceName);
 			buildArpRequest(buf, routeInterface, route);
 			continue;
@@ -390,6 +404,7 @@ int updatePacketInfo(unsigned char * buf, unsigned char sourceMac[6], unsigned c
 	struct iphdr * ipHeader = (struct iphdr *) ipHead;
 
 	if (ipHeader->ttl == 1) {
+		printf("TTL was 1, dropping packet.\n");
 		return 0;
 	}
 	ipHeader->ttl = ipHeader->ttl - 1;
