@@ -56,6 +56,7 @@ struct Interface {
 	int hasSavedPacket;
 	unsigned char savedPacket[BUFFER_SIZE];
 	int savedPacketLength;
+	int savedPacketSocket;
 };
 
 struct Route {
@@ -73,7 +74,7 @@ struct Route handleForwarding(unsigned char * buf, struct Interface interface, s
 void handleArpRequest(char buf[BUFFER_SIZE], struct Interface interface);
 void handleICMPRequest(char buf[BUFFER_SIZE], struct Interface interface);
 
-void addIpHeader(unsigned char * buf, unsigned char sourceIp[4], unsigned char destIp[4]);
+void addIpHeader(unsigned char * buf, unsigned char sourceIp[4], unsigned char destIp[4], int icmpSize);
 void addEthernetHeader(unsigned char * buf, unsigned char dest[6], unsigned char src[6], int ethType);
 void addICMPHeader(unsigned char * buf, char * data, char id[2], char seq[2]);
 void addArpResponseHeader(unsigned char * buf, unsigned char sourceMac[6], unsigned char destMac[6], unsigned char sourceIp[4], unsigned char destIp[4], int arpOp);
@@ -87,6 +88,7 @@ unsigned int calculateChecksum(unsigned char * buffer, int size);
 void processForwardingTable(FILE *file, struct Route routingTable[5]);
 
 struct Interface getInterfaceFromName(char * name, struct Interface interfaces[NUM_INTERFACE]);
+struct Interface getInterfaceFromPacketSocket(int packetSocket, struct Interface interfaces[NUM_INTERFACE]);
 
 void * loop(void * myInterface);
 
@@ -126,7 +128,6 @@ int main(int argc, char ** argv) {
 
 	srand(time(NULL));
 
-	struct Interface myInterface;
 	for (i = 0; i < NUM_INTERFACE; i++) { interfaces[i].valid = 0; }
 
 	//get list of interfaces (actually addresses)
@@ -247,8 +248,15 @@ void * loop(void * interface) {
 	myInterface1 = (struct Interface *)interface;
 	myInterface = *myInterface1;
 	printf("Ready to recieve now on interface %s\n", myInterface.name);
+
 	int waitingForArp = 0;
-	int arpWaitCount = 0;
+	struct timeval tv;
+	tv.tv_sec = 0;
+	tv.tv_usec = 100000;
+	if (setsockopt(myInterface.packet_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+		printf("Error setting the timeout...\n");
+	}
+
 	while (1) {
 		char buf[BUFFER_SIZE];
 		struct sockaddr_ll recvaddr;
@@ -257,9 +265,25 @@ void * loop(void * interface) {
 		if(recvaddr.sll_pkttype==PACKET_OUTGOING)
 			continue;
 		//start processing all others
+
+		//TODO: This means we have a timeout
 		if (n != -1) {
 			printf("Got a %d byte packet on interface %s\n", n, myInterface.name);
 		} else {
+			if (waitingForArp) {
+				printf("Didn't get an arp response.\n");
+				struct Interface routeInterface;
+				for (i = 0; i < NUM_INTERFACE; i++) {
+					if (interfaces[i].hasSavedPacket == 1) {
+						routeInterface = interfaces[i];
+					}
+				}
+
+				struct Interface errorInterface = getInterfaceFromPacketSocket(routeInterface.savedPacketSocket, interfaces);
+
+				waitingForArp = 0;
+				sendDestinationUnreachable(buf, errorInterface, 0x03, 0x01);
+			}
 			continue;
 		}
 
@@ -286,7 +310,7 @@ void * loop(void * interface) {
 
 			unsigned char savedPacket[BUFFER_SIZE];
 			memcpy(savedPacket, routeInterface.savedPacket, BUFFER_SIZE);
-			int update = updatePacketInfo(savedPacket, arpHeader->arp_dha, arpHeader->arp_sha);
+			int update = updatePacketInfo(savedPacket, myInterface, arpHeader->arp_dha, arpHeader->arp_sha);
 			if (update) {
 				printf("Forwarding packet on interface %s:\n", routeInterface.name);
 				for (i = 0; i < 42; i++) {
@@ -297,20 +321,6 @@ void * loop(void * interface) {
 			} // Else ignore packet because TTL is dead
 
 			continue;
-		}
-
-		if (waitingForArp == 1 && arpWaitCount < 3) {
-			arpWaitCount++;
-		} else if (waitingForArp == 1) {
-			arpWaitCount = 0;
-			struct Interface routeInterface;
-			for (i = 0; i < NUM_INTERFACE; i++) {
-				if (interfaces[i].hasSavedPacket == 1) {
-					routeInterface = interfaces[i];
-				}
-			}
-
-			sendDestinationUnreachable(buf, routeInterface, 0x03, 0x01);
 		}
 
 		//Handle forwarding
@@ -324,6 +334,7 @@ void * loop(void * interface) {
 					printf("Setting packet info on the interface.\n");
 					interfaces[i].savedPacketLength = n;
 					interfaces[i].hasSavedPacket = 1;
+					interfaces[i].savedPacketSocket = myInterface.packet_socket;
 					printf("Interface %s hasSavedPacket is %d.\n", interfaces[i].name, interfaces[i].hasSavedPacket);
 					memcpy(interfaces[i].savedPacket, buf, BUFFER_SIZE);
 				}
@@ -424,7 +435,7 @@ struct Route handleForwarding(unsigned char * buf, struct Interface interface, s
 }
 
 //Returns 1 if successful, return 0 if not
-int updatePacketInfo(unsigned char * buf, unsigned char sourceMac[6], unsigned char destMac[6]) {
+int updatePacketInfo(unsigned char * buf, struct Interface myInterface, unsigned char sourceMac[6], unsigned char destMac[6]) {
 	int i = 0;
 	unsigned char* ethhead = (unsigned char*) buf;
 	struct ethhdr *ethernetHeader = (struct ethhdr *) ethhead;
@@ -434,6 +445,7 @@ int updatePacketInfo(unsigned char * buf, unsigned char sourceMac[6], unsigned c
 
 	if (ipHeader->ttl == 1) {
 		printf("TTL was 1, dropping packet.\n");
+		sendDestinationUnreachable(buf, myInterface, 0x0b, 0x00);
 		return 0;
 	}
 	ipHeader->ttl = ipHeader->ttl - 1;
@@ -463,8 +475,6 @@ void handleICMPRequest(char buf[BUFFER_SIZE], struct Interface interface) {
 
 	unsigned char * icmpHead = (unsigned char *) buf + 14 + sizeof(struct iphdr);
 	struct icmphdr * icmpHeader = (struct icmphdr *) icmpHead;
-
-	//TODO: Do we need to check if the IP is ours?
 
 	//0x08 is an echo request
 	if (icmpHeader->type == 0x8) {
@@ -503,7 +513,7 @@ void handleICMPRequest(char buf[BUFFER_SIZE], struct Interface interface) {
 		}
 
 		addEthernetHeader(buffer, ethernetHeader->h_source, interface.macAddress, 0x0800);
-		addIpHeader(buffer, sourceIp, destIp);
+		addIpHeader(buffer, sourceIp, destIp, ICMP_SIZE - 14);
 		addICMPHeader(buffer, data, id, seq);
 
 		printf("Sending ICMP Response. \n");
@@ -512,7 +522,7 @@ void handleICMPRequest(char buf[BUFFER_SIZE], struct Interface interface) {
 	}
 }
 
-void addIpHeader(unsigned char * buf, unsigned char sourceIp[4], unsigned char destIp[4]) {
+void addIpHeader(unsigned char * buf, unsigned char sourceIp[4], unsigned char destIp[4], int icmpSize) {
 	int i;
 	unsigned char * ipHead = (unsigned char *) buf + 14;
 	struct iphdr * ipHeader = (struct iphdr *) ipHead;
@@ -520,7 +530,7 @@ void addIpHeader(unsigned char * buf, unsigned char sourceIp[4], unsigned char d
 	ipHeader->version = 0x4;
 	ipHeader->ihl = 0x5;
 	ipHeader->tos = 0;
-	ipHeader->tot_len = htons(ICMP_SIZE - 14); 
+	ipHeader->tot_len = htons(icmpSize); 
 	ipHeader->id = htons(rand());
 	ipHeader->frag_off = 0;
 	ipHeader->ttl = 64;
@@ -573,7 +583,21 @@ void addICMPHeader(unsigned char * buf, char * data, char id[2], char seq[2]) {
 }
 
 void sendDestinationUnreachable(unsigned char * buf, struct Interface interface, int icmpType, int icmpCode) {
-	printf("Sending Destination unreachable.\n");
+	switch(icmpType) {
+		case 0x03:
+			if (icmpCode == 0x00) {
+				printf("Sending Destination Unreachable on %s.\n", interface.name);
+			} else {
+				printf("Sending Host Unreachable on %s.\n", interface.name);
+			}
+			break;
+		case 0x0b:
+			printf("Sending TTL expired on %s.\n", interface.name);
+			break;
+		default:
+			printf("Something isn't right...\n");
+	}
+
 	int i = 0;
 	unsigned char* ethhead = (unsigned char*) buf;
 	struct ethhdr *ethernetHeader = (struct ethhdr *) ethhead;
@@ -601,29 +625,27 @@ void sendDestinationUnreachable(unsigned char * buf, struct Interface interface,
 	destIp[2] = ipHeader->saddr >> 16;
 	destIp[1] = ipHeader->saddr >> 8;
 	destIp[0] = ipHeader->saddr;
-
-	unsigned char sourceIp[4];
-	sourceIp[3] = ipHeader->daddr >> 24;
-	sourceIp[2] = ipHeader->daddr >> 16;
-	sourceIp[1] = ipHeader->daddr >> 8;
-	sourceIp[0] = ipHeader->daddr;
 	
-	addIpHeader(buf, sourceIp, destIp);
+	addIpHeader(buf, interface.ipAddress, destIp, 56);
 	
 	buf[14 + 20] = icmpType;
 	buf[14 + 20 + 1] = icmpCode;
 	buf[14 + 20 + 2] = 0;
 	buf[14 + 20 + 3] = 0;
+	buf[14 + 20 + 4] = 0;
+	buf[14 + 20 + 5] = 0;
+	buf[14 + 20 + 6] = 0;
+	buf[14 + 20 + 7] = 0;
 
 	for (i = 0; i < dataSize; i++) {
-		buf[14 + 20 + 4 + i] = icmpError[i];
+		buf[14 + 20 + 8 + i] = icmpError[i];
 	}
 
-	unsigned int checksum = calculateChecksum(buf + 14 + 20, 4 + dataSize);
+	unsigned int checksum = calculateChecksum(buf + 14 + 20, 8 + dataSize);
 	buf[14 + 20 + 2] = checksum >> 8;
 	buf[14 + 20 + 3] = checksum;
 
-	send(interface.packet_socket, buf, 14 + 20 + 4 + dataSize, 0);
+	send(interface.packet_socket, buf, 56 + 14, 0);
 }
 
 
@@ -789,30 +811,11 @@ struct Interface getInterfaceFromName(char * name, struct Interface interfaces[N
 	return NULL_STRUCT;
 }
 
-struct Interface getInterfaceFromIp(unsigned char ip[4], struct Interface interfaces[NUM_INTERFACE]) {
+struct Interface getInterfaceFromPacketSocket(int packetSocket, struct Interface interfaces[NUM_INTERFACE]) {
 	struct Interface NULL_STRUCT = {.valid = 0};	
 	int i, j;
 	for (i = 0; i < NUM_INTERFACE; i++) {
-		int equal = 1;
-		for (j = 0; j < 4; j++) {
-			equal &= interfaces[i].ipAddress[j] == ip[j];
-		}
-		if (equal) {
-			return interfaces[i];
-		}
-	}
-	return NULL_STRUCT;
-}
-
-struct Interface getInterfaceFromMac(unsigned char mac[6], struct Interface interfaces[NUM_INTERFACE]) {
-	struct Interface NULL_STRUCT = {.valid = 0};
-	int i, j;
-	for (i = 0; i < NUM_INTERFACE; i++) {
-		int equal = 1;
-		for (j = 0; j < 6; j++) {
-			equal &= interfaces[i].macAddress[j] == mac[j];
-		}
-		if (equal) {
+		if (interfaces[i].packet_socket == packetSocket) {
 			return interfaces[i];
 		}
 	}
